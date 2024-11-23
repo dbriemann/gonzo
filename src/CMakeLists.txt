@@ -1,4 +1,4 @@
-add_library(libgonzo libgonzo.cpp)
+add_library(libgonzo process.cpp)
 add_library(gonzo::libgonzo ALIAS libgonzo)
 
 set_target_properties(
