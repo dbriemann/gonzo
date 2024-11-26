@@ -1,11 +1,21 @@
 #include <csignal>
 #include <cstdlib>
+#include <cstring>
 #include <libgonzo/error.hpp>
+#include <libgonzo/pipe.hpp>
 #include <libgonzo/process.hpp>
 #include <sys/ptrace.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+namespace {
+void exit_with_perror(gonzo::pipe &channel, std::string const &prefix) {
+	auto message = prefix + ": " + std::strerror(errno);
+	channel.write(reinterpret_cast<std::byte *>(message.data()), message.size());
+	exit(-1);
+}
+} // namespace
 
 gonzo::stop_reason::stop_reason(int wait_status) {
 	if (WIFEXITED(wait_status)) {
@@ -23,12 +33,14 @@ gonzo::stop_reason::stop_reason(int wait_status) {
 gonzo::process::~process() {
 	if (pid_ != 0) {
 		int status;
-		if (state_ == process_state::running) {
-			kill(pid_, SIGSTOP);
-			waitpid(pid_, &status, 0);
+		if (is_attached_) {
+			if (state_ == process_state::running) {
+				kill(pid_, SIGSTOP);
+				waitpid(pid_, &status, 0);
+			}
+			ptrace(PTRACE_DETACH, pid_, nullptr, nullptr);
+			kill(pid_, SIGCONT);
 		}
-		ptrace(PTRACE_DETACH, pid_, nullptr, nullptr);
-		kill(pid_, SIGCONT);
 
 		if (terminate_on_end_) {
 			kill(pid_, SIGKILL);
@@ -37,21 +49,41 @@ gonzo::process::~process() {
 	}
 }
 
-std::unique_ptr<gonzo::process> gonzo::process::launch(std::filesystem::path path) {
+std::unique_ptr<gonzo::process> gonzo::process::launch(std::filesystem::path path, bool debug) {
+	pipe channel(true);
+
 	pid_t pid;
 	if ((pid = fork()) < 0) {
 		error::send_errno("fork failed");
 	}
 	if (pid == 0) {
-		if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) < 0) {
-			error::send_errno("tracing failed");
+		// Child process does not read from the pipe
+		channel.close_read();
+		if (debug and ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) < 0) {
+			exit_with_perror(channel, "tracing failed");
 		}
+		// ..and is replaced with other process.
 		if (execlp(path.c_str(), path.c_str(), nullptr) < 0) {
-			error::send_errno("exec failed");
+			exit_with_perror(channel, "exec failed for \"" + path.string() + "\"");
 		}
 	}
-	std::unique_ptr<process> proc(new process(pid, true));
-	proc->wait_on_signal();
+
+	// Parent process does not write into pipe.
+	channel.close_write();
+	auto data = channel.read();
+	channel.close_read();
+
+	if (data.size() > 0) {
+		waitpid(pid, nullptr, 0);
+		auto chars = reinterpret_cast<char *>(data.data());
+		error::send(std::string(chars, chars + data.size()));
+	}
+
+	std::unique_ptr<process> proc(new process(pid, true, debug));
+	if (debug) {
+		proc->wait_on_signal();
+	}
+
 	return proc;
 }
 
@@ -59,11 +91,14 @@ std::unique_ptr<gonzo::process> gonzo::process::attach(pid_t pid) {
 	if (pid == 0) {
 		error::send("invalid PID");
 	}
+
 	if (ptrace(PTRACE_ATTACH, pid, nullptr, nullptr) < 0) {
 		error::send_errno("could not attach");
 	}
-	std::unique_ptr<process> proc(new process(pid, false));
+
+	std::unique_ptr<process> proc(new process(pid, false, true));
 	proc->wait_on_signal();
+
 	return proc;
 }
 
